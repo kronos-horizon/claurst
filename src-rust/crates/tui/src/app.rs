@@ -1573,12 +1573,53 @@ impl App {
             self.model_registry.load_cache(&cache_path);
         }
 
-        let models = crate::model_picker::models_for_provider_from_registry(
+        let mut models = crate::model_picker::models_for_provider_from_registry(
             provider_id,
             &self.model_registry,
         );
+        // If the registry has no real entries (only the "default" stub), seed
+        // from the provider config whitelist so locally-configured providers
+        // show their models immediately without waiting for the API fetch.
+        let whitelist_is_useful = models.len() == 1 && models[0].id == "default";
+        if whitelist_is_useful {
+            if let Some(pc) = self.config.provider_configs.get(provider_id) {
+                if !pc.models_whitelist.is_empty() {
+                    models = pc.models_whitelist.iter().map(|id| crate::model_picker::ModelEntry {
+                        id: id.clone(),
+                        display_name: id.clone(),
+                        description: "local".to_string(),
+                        is_current: false,
+                    }).collect();
+                }
+            }
+        }
         self.model_picker.set_models(models);
         self.model_picker_fetch_pending = true;
+
+        // Spawn a background task to fetch the live model list from the provider API.
+        let config_clone = self.config.clone();
+        let pid = provider_id.to_string();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        self.model_fetch_rx = Some(rx);
+        tokio::spawn(async move {
+            let provider = claurst_api::registry::provider_from_config(&config_clone, &pid);
+            let result = match provider {
+                Some(p) => p.list_models().await.ok().map(|infos| {
+                    infos.into_iter().map(|m| crate::model_picker::ModelEntry {
+                        id: m.id.to_string(),
+                        display_name: m.name.clone(),
+                        description: format!("{} ctx", m.context_window),
+                        is_current: false,
+                    }).collect::<Vec<_>>()
+                }),
+                None => None,
+            };
+            if let Some(entries) = result {
+                if !entries.is_empty() {
+                    let _ = tx.send(Ok(entries)).await;
+                }
+            }
+        });
 
         let provider_prefix = format!("{}/", provider_id);
         let current_model = if self.config.provider.as_deref() == Some(provider_id) {
@@ -5627,6 +5668,22 @@ impl App {
     ) -> anyhow::Result<Option<String>> {
         loop {
             self.frame_count = self.frame_count.wrapping_add(1);
+
+            // Drain background model-fetch results.
+            if let Some(ref mut rx) = self.model_fetch_rx {
+                match rx.try_recv() {
+                    Ok(Ok(entries)) => {
+                        self.model_picker.set_models(entries);
+                        self.model_picker_fetch_pending = false;
+                        self.model_fetch_rx = None;
+                    }
+                    Ok(Err(())) | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.model_picker_fetch_pending = false;
+                        self.model_fetch_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
 
             // Drain background session-list results.
             if let Some(ref mut rx) = self.session_list_rx {
