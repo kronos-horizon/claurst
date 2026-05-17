@@ -398,6 +398,10 @@ pub struct ModelPickerState {
     pub models_loaded: bool,
     /// `true` while the background fetch is in flight.
     pub loading_models: bool,
+    /// The model ID that was active when the picker was opened.
+    /// Used to restore the cursor position (and is_current flag) after a
+    /// live model list arrives from the provider API.
+    pub current_model_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +422,7 @@ impl ModelPickerState {
             fast_mode_model: None,
             models_loaded: false,
             loading_models: false,
+            current_model_id: None,
         }
     }
 
@@ -455,6 +460,7 @@ impl ModelPickerState {
         self.effort_level = effort;
         self.fast_mode = fast_mode;
         self.fast_mode_model = fast_mode.then_some(current_model.to_string());
+        self.current_model_id = Some(current_model.to_string());
         self.visible = true;
     }
 
@@ -583,14 +589,23 @@ impl ModelPickerState {
     /// Called by the app event loop when the background fetch completes.
     /// Resets `loading_models` and sets `models_loaded`.
     pub fn set_models(&mut self, entries: Vec<ModelEntry>) {
+        // Apply is_current flag from the remembered model before replacing.
+        let current_id = self.current_model_id.clone();
         self.models = entries;
+        if let Some(ref id) = current_id {
+            for m in &mut self.models {
+                m.is_current = &m.id == id;
+            }
+        }
         self.loading_models = false;
         self.models_loaded = true;
-        // Keep selected_idx in bounds.
-        let count = self.filtered_models().len();
-        if count > 0 && self.selected_idx >= count {
-            self.selected_idx = count - 1;
-        }
+        // Restore cursor to the previously-selected model; fall back to 0
+        // if the model no longer exists on the endpoint.
+        let filtered = self.filtered_models();
+        self.selected_idx = current_id
+            .as_deref()
+            .and_then(|id| filtered.iter().position(|m| m.id == id))
+            .unwrap_or(0);
     }
 
     /// Fetch the list of available models from the Anthropic API and convert
