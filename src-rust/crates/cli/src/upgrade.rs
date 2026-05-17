@@ -15,7 +15,27 @@ use std::time::Duration;
 const REPO: &str = "Kuberwastaken/claurst";
 const APP: &str = "claurst";
 
+/// Fork build: automatic binary replacement from upstream is disabled.
+/// The update-check notification still works so you know when to look,
+/// but `claurst upgrade` will not overwrite this fork's binary.
+/// Set `CLAURST_ALLOW_UPSTREAM_UPGRADE=1` to bypass this safeguard.
+const FORK_BUILD: bool = true;
+
 pub async fn run_upgrade(args: &[String]) -> Result<()> {
+    if FORK_BUILD
+        && std::env::var("CLAURST_ALLOW_UPSTREAM_UPGRADE")
+            .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    {
+        let latest = fetch_latest_version().await.unwrap_or_else(|_| "unknown".into());
+        let current = env!("CARGO_PKG_VERSION");
+        println!("This is a fork build — automatic upgrade from upstream is disabled.");
+        println!("Current version : {current}");
+        println!("Upstream latest : {latest}");
+        println!("To update, pull from the fork repository and rebuild.");
+        println!("(Set CLAURST_ALLOW_UPSTREAM_UPGRADE=1 to bypass this check.)");
+        return Ok(());
+    }
     // -------- arg parsing --------
     let mut requested_version: Option<String> = None;
     let mut force = false;

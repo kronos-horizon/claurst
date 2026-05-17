@@ -831,6 +831,8 @@ pub struct App {
     /// Shown at startup when --dangerously-skip-permissions was passed.
     /// User must explicitly accept or the session exits.
     pub bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState,
+    /// Whether the bypass-permissions dialog has been shown this session.
+    pub bypass_permissions_dialog_shown: bool,
     /// First-launch onboarding welcome dialog.
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
     /// API key input dialog (opened from /connect for key-based providers).
@@ -1258,6 +1260,7 @@ impl App {
             mcp_approval: McpApprovalDialogState::new(),
             go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
+            bypass_permissions_dialog_shown: false,
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
             custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState::new(),
@@ -2957,6 +2960,19 @@ impl App {
                 KeyCode::Backspace => {
                     self.key_input_dialog.backspace();
                 }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER) => {
+                    if let Some(text) = crate::image_paste::read_clipboard_text() {
+                        if text.is_empty() {
+                            self.notifications.push(NotificationKind::Warning, "Clipboard is empty".to_string(), Some(2));
+                        } else {
+                            for ch in text.chars() {
+                                self.key_input_dialog.insert_char(ch);
+                            }
+                        }
+                    } else {
+                        self.notifications.push(NotificationKind::Warning, "Could not read clipboard".to_string(), Some(2));
+                    }
+                }
                 KeyCode::Char(c) => {
                     self.key_input_dialog.insert_char(c);
                 }
@@ -3740,11 +3756,12 @@ impl App {
             return false;
         }
 
-        // ---- Ctrl+V — clipboard paste (image first, then text fallback) ----
+        // ---- Ctrl+V / Cmd+V — clipboard paste (image first, then text fallback) ----
         // Only fires when NOT in vim Normal/Visual/VisualBlock mode (where \x16 is
         // already consumed by the vim handler above to enter VisualBlock mode).
         if key.code == KeyCode::Char('v')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && (key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::SUPER))
             && !matches!(
                 self.prompt_input.vim_mode,
                 crate::prompt_input::VimMode::Normal
@@ -3884,6 +3901,19 @@ impl App {
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
             }
+            // With the kitty keyboard protocol, Shift+/ is reported as Char('/') with
+            // SHIFT rather than Char('?'), so also accept that form for the help toggle.
+            KeyCode::Char('/')
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !self.is_streaming
+                    && self.prompt_input.is_empty()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
+                self.show_help = !self.show_help;
+                self.help_overlay.toggle();
+            }
 
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
                 self.prompt_input.kill_line_backward();
@@ -3926,6 +3956,14 @@ impl App {
 
             // ---- Text entry (blocked while streaming) ------------------
             KeyCode::Char(c) if !self.is_streaming => {
+                // With the kitty keyboard protocol, Shift+letter is reported as the base
+                // (lowercase) key with the SHIFT modifier.  Apply uppercase so the
+                // correct character is inserted.
+                let c = if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_alphabetic() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                };
                 if self.prompt_input.vim_enabled && self.prompt_input.vim_mode != VimMode::Insert {
                     self.prompt_input.vim_command(&c.to_string());
                 } else {

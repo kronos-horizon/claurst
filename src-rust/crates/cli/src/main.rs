@@ -638,6 +638,7 @@ async fn main() -> anyhow::Result<()> {
         pending_permissions: Some(pending_permissions.clone()),
         permission_manager: Some(permission_manager.clone()),
         user_question_tx: if is_non_interactive { None } else { Some(user_question_tx) },
+        team_depth: 0,
     };
 
     // Hourly shadow-snapshot GC loop: only runs when snapshot is explicitly enabled.
@@ -1706,25 +1707,28 @@ async fn run_interactive(
         app.agent_mode = Some(agent_name.clone());
     }
 
-    // Show onboarding: status hint if no credentials, welcome tour if first run.
-    // Skip the welcome tour entirely if the user already has credentials — they've
-    // clearly set things up (via /connect or env vars) and don't need onboarding.
-    if !has_credentials {
-        if !settings.has_completed_onboarding {
-            app.onboarding_dialog.show();
-        } else {
-            app.status_message = Some("No provider configured. Run /connect to set one up.".to_string());
-        }
-    } else if !settings.has_completed_onboarding {
-        // User has credentials but hasn't formally completed onboarding — mark it done
-        // silently so they never see it.
-        let _ = claurst_tui::App::persist_onboarding_complete_pub();
-    }
-
     // Mirror TS BypassPermissionsModeDialog.tsx startup gate
+    // Shown as the highest-priority startup dialog (blocks all other UI).
+    // Only show once per session — subsequent sessions in the same directory
+    // will show the dialog again (not persisted across sessions).
     use claurst_core::config::PermissionMode;
-    if live_config.permission_mode == PermissionMode::BypassPermissions {
+    if live_config.permission_mode == PermissionMode::BypassPermissions && !app.bypass_permissions_dialog_shown {
         app.bypass_permissions_dialog.show();
+        app.bypass_permissions_dialog_shown = true;
+    } else if live_config.permission_mode != PermissionMode::BypassPermissions {
+        // Show onboarding only if NOT in bypass-permissions mode.
+        // Bypass dialog is a mandatory security gate and takes absolute priority.
+        if !has_credentials {
+            if !settings.has_completed_onboarding {
+                app.onboarding_dialog.show();
+            } else {
+                app.status_message = Some("No provider configured. Run /connect to set one up.".to_string());
+            }
+        } else if !settings.has_completed_onboarding {
+            // User has credentials but hasn't formally completed onboarding — mark it done
+            // silently so they never see it.
+            let _ = claurst_tui::App::persist_onboarding_complete_pub();
+        }
     }
 
     // Version-upgrade notice: record the current version for future comparisons.
@@ -2597,6 +2601,22 @@ async fn run_interactive(
                         messages = app.messages.clone();
                         session.messages = messages.clone();
                         session.updated_at = chrono::Utc::now();
+                    }
+                }
+                Event::Paste(data) => {
+                    // Cmd+V paste on macOS / Ctrl+Shift+V on Linux (via bracketed paste)
+                    if !app.is_streaming
+                        && app.permission_request.is_none()
+                        && !app.history_search_overlay.visible
+                        && app.history_search.is_none()
+                    {
+                        if app.key_input_dialog.visible {
+                            for ch in data.chars() {
+                                app.key_input_dialog.insert_char(ch);
+                            }
+                        } else {
+                            app.prompt_input.paste(&data);
+                        }
                     }
                 }
                 Event::Mouse(mouse) => {

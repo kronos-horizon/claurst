@@ -27,6 +27,15 @@ use tracing::{debug, warn};
 const SETTINGS_FILENAME: &str = "remote-settings.json";
 const SETTINGS_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MAX_RETRIES: u32 = 5;
+
+/// Fork build flag: disables all outbound calls to Anthropic's remote-settings
+/// endpoint.  Set the environment variable `CLAURST_PHONE_HOME=1` to opt in.
+/// Defaults to `false` — no data is sent to Anthropic without explicit consent.
+fn phone_home_enabled() -> bool {
+    std::env::var("CLAURST_PHONE_HOME")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 /// 1-hour polling interval (matches TypeScript POLLING_INTERVAL_MS)
 pub const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -277,7 +286,11 @@ impl RemoteSettingsManager {
     /// Full fetch-and-cache cycle: read disk cache → HTTP fetch → save to disk.
     ///
     /// Fails open: returns the stale cached value (or `None`) on any error.
+    /// No-op (returns `None`) unless `CLAURST_PHONE_HOME=1` is set.
     pub async fn fetch_once_and_cache(&self) -> Option<Value> {
+        if !phone_home_enabled() {
+            return None;
+        }
         // Load any previously cached settings to compute an ETag checksum.
         let cached_raw = match tokio::fs::read_to_string(&self.cache_path).await {
             Ok(text) => Some(text),
@@ -324,7 +337,13 @@ impl RemoteSettingsManager {
     ///
     /// Polls every `config.polling_interval`, gracefully degrading on failures.
     /// Stops when `cancel` is triggered.
+    ///
+    /// No-op unless `CLAURST_PHONE_HOME=1` is set in the environment.
     pub async fn start_polling(self: Arc<Self>, cancel: CancellationToken) {
+        if !phone_home_enabled() {
+            debug!("Remote settings: phone-home disabled (set CLAURST_PHONE_HOME=1 to enable)");
+            return;
+        }
         let mut interval = tokio::time::interval(self.config.polling_interval);
         // The first tick fires immediately; skip it so we don't double-fetch at startup.
         interval.tick().await;
