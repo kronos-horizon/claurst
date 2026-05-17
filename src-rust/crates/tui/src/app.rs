@@ -6044,8 +6044,8 @@ mod tests {
         assert!(!app.prompt_input.vim_enabled);
     }
 
-    #[test]
-    fn test_model_slash_command_opens_picker() {
+    #[tokio::test]
+    async fn test_model_slash_command_opens_picker() {
         let mut app = make_app();
         assert!(!app.model_picker.visible);
         assert!(app.intercept_slash_command("model"));
@@ -6181,8 +6181,8 @@ mod tests {
         assert_eq!(app.prompt_input.text, "why?");
     }
 
-    #[test]
-    fn test_ctrl_a_shortcut_opens_model_picker() {
+    #[tokio::test]
+    async fn test_ctrl_a_shortcut_opens_model_picker() {
         let mut app = make_app();
         app.has_credentials = true;
         app.config.provider = Some("anthropic".to_string());

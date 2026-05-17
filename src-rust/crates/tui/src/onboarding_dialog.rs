@@ -387,7 +387,7 @@ mod tests {
     fn onboarding_defaults_hidden() {
         let state = OnboardingDialogState::new();
         assert!(!state.visible);
-        assert_eq!(state.page, OnboardingPage::Welcome);
+        assert_eq!(state.page, OnboardingPage::ProviderSetup);
     }
 
     #[test]

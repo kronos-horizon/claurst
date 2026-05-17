@@ -157,7 +157,9 @@ fn system_message_preserves_text() {
 
 #[test]
 fn thinking_block_collapsed() {
-    let lines = render_thinking_block("hidden thoughts", false);
+    // render_thinking_block uses the first line as a collapsed heading preview;
+    // subsequent lines should only appear when expanded == true.
+    let lines = render_thinking_block("Topic summary\nhidden thoughts", false);
     assert_eq!(lines.len(), 1);
     let text = flatten(&lines);
     assert!(text.contains("Thinking"));
