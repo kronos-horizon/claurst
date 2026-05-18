@@ -1567,6 +1567,30 @@ impl App {
         crate::model_picker::default_model_for_provider(provider_id, &self.model_registry)
     }
 
+    /// Path for the per-provider model list cache.
+    fn provider_model_cache_path(provider_id: &str) -> Option<std::path::PathBuf> {
+        dirs::cache_dir().map(|d| d.join("claurst").join(format!("models-{}.json", provider_id)))
+    }
+
+    /// Load a previously-cached provider model list from disk, if present.
+    fn load_provider_model_cache(provider_id: &str) -> Option<Vec<crate::model_picker::ModelEntry>> {
+        let path = Self::provider_model_cache_path(provider_id)?;
+        let data = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    /// Persist a provider model list to the per-provider cache file.
+    fn save_provider_model_cache(provider_id: &str, entries: &[crate::model_picker::ModelEntry]) {
+        if let Some(path) = Self::provider_model_cache_path(provider_id) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string(entries) {
+                let _ = std::fs::write(&path, json);
+            }
+        }
+    }
+
     fn open_model_picker_for_provider(&mut self, provider_id: &str, title: Option<String>) {
         let cache_path = dirs::cache_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -1585,7 +1609,13 @@ impl App {
         // show their models immediately without waiting for the API fetch.
         let whitelist_is_useful = models.len() == 1 && models[0].id == "default";
         if whitelist_is_useful {
-            if let Some(pc) = self.config.provider_configs.get(provider_id) {
+            // Try the per-provider disk cache first (populated by a previous
+            // live fetch), so the correct model list appears immediately.
+            if let Some(cached) = Self::load_provider_model_cache(provider_id) {
+                if !cached.is_empty() {
+                    models = cached;
+                }
+            } else if let Some(pc) = self.config.provider_configs.get(provider_id) {
                 if !pc.models_whitelist.is_empty() {
                     models = pc.models_whitelist.iter().map(|id| crate::model_picker::ModelEntry {
                         id: id.clone(),
@@ -5711,6 +5741,11 @@ impl App {
             if let Some(ref mut rx) = self.model_fetch_rx {
                 match rx.try_recv() {
                     Ok(Ok(entries)) => {
+                        // Persist the live API results so next session opens
+                        // the picker instantly with the correct model list.
+                        if let Some(pid) = self.config.provider.as_deref() {
+                            Self::save_provider_model_cache(pid, &entries);
+                        }
                         self.model_picker.set_models(entries);
                         self.model_picker_fetch_pending = false;
                         self.model_fetch_rx = None;

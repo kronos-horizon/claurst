@@ -220,7 +220,7 @@ impl ModelPickerState {
 // ---------------------------------------------------------------------------
 
 /// A single model entry shown in the picker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelEntry {
     pub id: String,
     pub display_name: String,
