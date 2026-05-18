@@ -1626,6 +1626,23 @@ impl App {
                 }
             }
         }
+        // If still just the "default" stub (no cache, no whitelist), seed the
+        // list with the currently-active model so the picker is always useful
+        // while the background fetch is in flight.
+        if models.len() == 1 && models[0].id == "default"
+            && self.config.provider.as_deref() == Some(provider_id)
+        {
+            let prefix = format!("{}/", provider_id);
+            let active = self.model_name.strip_prefix(&prefix).unwrap_or(&self.model_name);
+            if !active.is_empty() && active != "default" {
+                models = vec![crate::model_picker::ModelEntry {
+                    id: active.to_string(),
+                    display_name: active.to_string(),
+                    description: "current model".to_string(),
+                    is_current: true,
+                }];
+            }
+        }
         self.model_picker.set_models(models);
         self.model_picker_fetch_pending = true;
 

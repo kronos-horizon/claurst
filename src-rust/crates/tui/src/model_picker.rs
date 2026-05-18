@@ -1210,4 +1210,79 @@ mod tests {
         let ids: Vec<&str> = p.models.iter().map(|m| m.id.as_str()).collect();
         assert!(!ids.iter().any(|id| id.contains("claude")));
     }
+
+    // 19. set_models preserves the cursor when the user moved it before the
+    //     live fetch returned (regression: previously snapped back to
+    //     current_model_id).
+    #[test]
+    fn set_models_preserves_cursor_moved_by_user() {
+        let mut p = ModelPickerState::new();
+        p.open("model-a");
+
+        // Initial sync list: two stub entries
+        p.set_models(vec![
+            model_entry("model-a", "Model A", ""),
+            model_entry("model-b", "Model B", ""),
+        ]);
+        assert_eq!(p.selected_idx, 0); // cursor at model-a (current)
+
+        // User moves cursor to model-b before the background fetch returns.
+        p.select_next();
+        assert_eq!(p.selected_idx, 1);
+
+        // Background fetch returns with a richer list containing both models.
+        p.set_models(vec![
+            model_entry("model-a", "Model A", "updated"),
+            model_entry("model-b", "Model B", "updated"),
+            model_entry("model-c", "Model C", "new"),
+        ]);
+
+        // Cursor must stay at model-b (where the user moved it), not snap back
+        // to model-a (current_model_id).
+        let selected = p.filtered_models()[p.selected_idx].id.clone();
+        assert_eq!(selected, "model-b", "cursor should stay where user left it");
+    }
+
+    // 20. set_models falls back to current_model_id when the model the cursor
+    //     was pointing at no longer exists in the live list.
+    #[test]
+    fn set_models_falls_back_to_current_model_when_pointed_removed() {
+        let mut p = ModelPickerState::new();
+        p.open("model-a");
+
+        p.set_models(vec![
+            model_entry("model-a", "Model A", ""),
+            model_entry("model-temp", "Temp", ""),
+        ]);
+        // Move cursor to model-temp (which won't be in the live list).
+        p.select_next();
+        assert_eq!(p.selected_idx, 1);
+
+        // Live fetch arrives without model-temp.
+        p.set_models(vec![
+            model_entry("model-a", "Model A", ""),
+            model_entry("model-b", "Model B", ""),
+        ]);
+
+        // Falls back to current_model_id ("model-a"), not 0 blindly.
+        let selected = p.filtered_models()[p.selected_idx].id.clone();
+        assert_eq!(selected, "model-a");
+    }
+
+    // 21. set_models falls back to index 0 when neither the pointed-at model
+    //     nor current_model_id exist in the new list.
+    #[test]
+    fn set_models_falls_back_to_zero_when_both_missing() {
+        let mut p = ModelPickerState::new();
+        // No open() call — current_model_id is None.
+        p.set_models(vec![model_entry("old", "Old", "")]);
+
+        // Fetch arrives with a completely different set.
+        p.set_models(vec![
+            model_entry("new-a", "New A", ""),
+            model_entry("new-b", "New B", ""),
+        ]);
+
+        assert_eq!(p.selected_idx, 0);
+    }
 }
