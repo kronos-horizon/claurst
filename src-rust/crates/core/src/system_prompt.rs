@@ -409,21 +409,7 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
         .unwrap_or(false);
 
     // Today's date
-    let today = {
-        // Use chrono if available; otherwise fall back to env or skip
-        // We avoid adding a new dep just for formatting, so use a rough ISO format.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Simple YYYY-MM-DD from seconds since epoch
-        let days = now / 86400;
-        let year_approx = 1970 + days / 365;
-        // Not perfectly accurate but good enough for the system prompt context.
-        // For exact dates a chrono dep would be needed; use SystemTime string as fallback.
-        format!("{}", year_approx)
-    };
-    let _ = today; // suppress unused warning — date is included below via SystemTime
+    let today = chrono::Local::now().format("%A, %B %-d, %Y").to_string();
 
     // Build the section
     let cwd_line = working_dir
@@ -452,12 +438,13 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
     };
 
     format!(
-        "\n<env>{}\nIs directory a git repo: {}\nPlatform: {}\nOS Version: {}\n{}{}\n</env>",
+        "\n<env>{}\nIs directory a git repo: {}\nPlatform: {}\nOS Version: {}\n{}\nToday's date: {}{}\n</env>",
         cwd_line,
         if is_git { "Yes" } else { "No" },
         platform,
         os_version,
         shell_line,
+        today,
         os_note,
     )
 }
