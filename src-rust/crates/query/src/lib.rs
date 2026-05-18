@@ -730,7 +730,9 @@ pub async fn run_query_loop(
     }
 
     let mut used_fallback = false;
-    // How many automatic retries remain when a stream stalls (no data for 45s).
+    // How many automatic retries remain when a stream stalls.
+    // Provider path uses a 300s stall (covers cold model-load on llama-swap);
+    // Anthropic path uses a 45s stall (cloud API, should never need >30s).
     let mut retries_left: u32 = 2;
 
     // If an agent defines a max_turns override, respect it (agent wins over config).
@@ -1154,10 +1156,15 @@ pub async fn run_query_loop(
                     let mut msg_id = uuid::Uuid::new_v4().to_string();
 
                     use futures::StreamExt as ProviderStreamExt;
-                    let provider_stall_timeout = std::time::Duration::from_secs(45);
+                    // 300 s — generous enough for cold model loads on llama-swap
+                    // (a 70B Q4_K_M model can take ~60-90 s to load from NVMe).
+                    // The timer resets on every received SSE event, so a long
+                    // load followed by fast streaming never triggers a false stall.
+                    let provider_stall_timeout = std::time::Duration::from_secs(300);
                     let provider_stall = tokio::time::sleep(provider_stall_timeout);
                     tokio::pin!(provider_stall);
                     let mut provider_stream_stalled = false;
+                    let mut provider_stream_errored = false;
 
                     loop {
                         tokio::select! {
@@ -1174,6 +1181,7 @@ pub async fn run_query_loop(
                                     None => break,
                                     Some(Err(e)) => {
                                         error!(provider = %provider_id_str, error = %e, "Provider stream error");
+                                        provider_stream_errored = true;
                                         break;
                                     }
                                     Some(Ok(evt)) => {
@@ -1230,13 +1238,17 @@ pub async fn run_query_loop(
                         }
                     }
 
-                    // If the stream stalled (no data for 45s), retry.
-                    if provider_stream_stalled && retries_left > 0 {
+                    // If the stream stalled (no data for 300s) or the body decoder
+                    // emitted an error mid-stream (e.g. reqwest "error decoding response
+                    // body"), retry the turn using the shared retries_left budget.
+                    if (provider_stream_stalled || provider_stream_errored) && retries_left > 0 {
                         retries_left -= 1;
-                        warn!(provider = %provider_id_str, model = %model_id_str, retries_left, "Provider stream stalled — retrying");
+                        let reason = if provider_stream_errored { "Stream error" } else { "No response for 300s" };
+                        warn!(provider = %provider_id_str, model = %model_id_str, retries_left, %reason, "Provider stream failed — retrying");
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::Status(format!(
-                                "No response for 45s — retrying ({} left)…",
+                                "{} — retrying ({} left)…",
+                                reason,
                                 retries_left + 1
                             )));
                         }
@@ -2408,6 +2420,174 @@ mod tests {
             options["reasoningConfig"]["budgetTokens"],
             serde_json::json!(10_000)
         );
+    }
+
+    // ---- stream error retry ------------------------------------------------
+    //
+    // Verifies that a ProviderError::StreamError mid-stream triggers the same
+    // automatic retry logic as a stall timeout, using the shared retries_left
+    // budget.  The mock provider fails on the first call and succeeds on the
+    // second; we assert the outcome is EndTurn with the retried response.
+
+    use std::pin::Pin;
+    use async_trait::async_trait;
+
+    struct MockStreamErrorProvider {
+        call_count: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait]
+    impl claurst_api::provider::LlmProvider for MockStreamErrorProvider {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            static ID: once_cell::sync::Lazy<claurst_core::provider_id::ProviderId> =
+                once_cell::sync::Lazy::new(|| claurst_core::provider_id::ProviderId::new("test-mock"));
+            &ID
+        }
+
+        fn name(&self) -> &str {
+            "TestMock"
+        }
+
+        async fn create_message(
+            &self,
+            _req: claurst_api::provider_types::ProviderRequest,
+        ) -> Result<claurst_api::provider_types::ProviderResponse, claurst_api::provider_error::ProviderError> {
+            unimplemented!("test mock only supports streaming")
+        }
+
+        async fn create_message_stream(
+            &self,
+            _req: claurst_api::provider_types::ProviderRequest,
+        ) -> Result<
+            Pin<Box<dyn futures::Stream<Item = Result<claurst_api::provider_types::StreamEvent, claurst_api::provider_error::ProviderError>> + Send>>,
+            claurst_api::provider_error::ProviderError,
+        > {
+            let n = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                let err = claurst_api::provider_error::ProviderError::StreamError {
+                    provider: claurst_core::provider_id::ProviderId::new("test-mock"),
+                    message: "error decoding response body: connection reset".to_string(),
+                    partial_response: None,
+                };
+                Ok(Box::pin(futures::stream::once(async move { Err(err) })))
+            } else {
+                use claurst_api::provider_types::{StreamEvent, StopReason};
+                let events: Vec<Result<StreamEvent, claurst_api::provider_error::ProviderError>> = vec![
+                    Ok(StreamEvent::TextDelta { index: 0, text: "Hello!".to_string() }),
+                    Ok(StreamEvent::MessageDelta { stop_reason: Some(StopReason::EndTurn), usage: None }),
+                    Ok(StreamEvent::MessageStop),
+                ];
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        async fn list_models(
+            &self,
+        ) -> Result<Vec<claurst_api::provider::ModelInfo>, claurst_api::provider_error::ProviderError> {
+            Ok(vec![])
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::provider_types::ProviderStatus, claurst_api::provider_error::ProviderError> {
+            Ok(claurst_api::provider_types::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::provider_types::ProviderCapabilities {
+            claurst_api::provider_types::ProviderCapabilities {
+                streaming: true,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::provider_types::SystemPromptStyle::SystemMessage,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_stream_error_triggers_retry() {
+        use claurst_core::config::PermissionMode;
+        use claurst_core::permissions::AutoPermissionHandler;
+        use claurst_tools::ToolContext;
+        use std::sync::atomic::AtomicUsize;
+
+        let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mock = Arc::new(MockStreamErrorProvider { call_count: call_count.clone() });
+
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(mock);
+
+        let mut core_config = claurst_core::config::Config::default();
+        core_config.provider = Some("test-mock".to_string());
+
+        let tool_ctx = ToolContext {
+            working_dir: std::path::PathBuf::from("/tmp"),
+            permission_mode: PermissionMode::Default,
+            permission_handler: Arc::new(AutoPermissionHandler { mode: PermissionMode::Default }),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "stream-err-retry-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: core_config,
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            team_depth: 0,
+        };
+
+        let query_config = QueryConfig {
+            model: "test-model".to_string(),
+            provider_registry: Some(Arc::new(registry)),
+            max_turns: 2,
+            ..make_config(None, None)
+        };
+
+        let dummy_client =
+            claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig::default())
+                .expect("dummy AnthropicClient");
+
+        let mut messages = vec![claurst_core::types::Message::user("ping")];
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let outcome = run_query_loop(
+            &dummy_client,
+            &mut messages,
+            &[],
+            &tool_ctx,
+            &query_config,
+            tool_ctx.cost_tracker.clone(),
+            None,
+            cancel,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "provider should be called twice: once for the stream error, once for the retry"
+        );
+        match outcome {
+            QueryOutcome::EndTurn { message, .. } => {
+                assert!(
+                    message.get_all_text().contains("Hello!"),
+                    "retry should return the successful response; got: {}",
+                    message.get_all_text()
+                );
+            }
+            other => panic!("expected EndTurn after stream error retry, got: {:?}", other),
+        }
     }
 }
 
