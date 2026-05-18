@@ -273,6 +273,9 @@ pub struct ToolContext {
     /// Channel for the `AskUserQuestion` tool to send questions to the TUI and
     /// receive the user's typed answer.  `None` in headless / non-interactive mode.
     pub user_question_tx: Option<tokio::sync::mpsc::UnboundedSender<UserQuestionEvent>>,
+    /// Tracks how many nested `TeamCreate` calls deep this context is.
+    /// `TeamCreateTool` refuses to execute once this reaches `MAX_TEAM_DEPTH`.
+    pub team_depth: u32,
 }
 
 impl ToolContext {
@@ -604,6 +607,7 @@ mod tests {
             pending_permissions: None,
             permission_manager: None,
             user_question_tx: None,
+            team_depth: 0,
         }
     }
 

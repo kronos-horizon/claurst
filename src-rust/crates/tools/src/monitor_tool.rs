@@ -271,6 +271,7 @@ mod tests {
             pending_permissions: None,
             permission_manager: None,
             user_question_tx: None,
+            team_depth: 0,
         }
     }
 }

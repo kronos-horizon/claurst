@@ -12,7 +12,7 @@ use claurst_core::provider_id::{ModelId, ProviderId};
 use claurst_core::types::{ContentBlock, UsageInfo};
 use futures::Stream;
 use serde_json::{json, Value};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error_handling::parse_error_response;
 use crate::provider::{LlmProvider, ModelInfo};
@@ -25,6 +25,19 @@ use crate::provider_types::{
 // Re-use the message transformation helpers from openai.rs.
 use super::openai::OpenAiProvider;
 use super::request_options::merge_openai_compatible_options;
+
+// ---------------------------------------------------------------------------
+// Retry constants
+// ---------------------------------------------------------------------------
+
+/// Initial backoff delay in milliseconds before the first retry.
+const RETRY_INITIAL_DELAY_MS: u64 = 500;
+/// Geometric backoff multiplier applied after each failed attempt (1.5× ≈ gentler than 2× exponential).
+const RETRY_GEOMETRIC_RATIO: f64 = 1.5;
+/// Hard cap on retry delay.
+const RETRY_MAX_DELAY_MS: u64 = 30_000;
+/// Maximum number of send attempts (1 initial + 7 retries).
+const RETRY_MAX_ATTEMPTS: u32 = 8;
 
 // ---------------------------------------------------------------------------
 // ProviderQuirks
@@ -394,6 +407,67 @@ impl OpenAiCompatProvider {
         parse_error_response(status, body, &self.id)
     }
 
+    /// Send an HTTP request with geometric backoff retries on 429/503 throttle responses.
+    ///
+    /// `build_request` is called fresh on every attempt so the `RequestBuilder`
+    /// (which is consumed by `.send()`) can be reconstructed without cloning.
+    /// Respects the `Retry-After` header when present; otherwise uses a 1.5×
+    /// geometric delay sequence starting at 500 ms, capped at 30 s.
+    async fn send_with_retry<F>(&self, build_request: F) -> Result<reqwest::Response, ProviderError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut delay_ms = RETRY_INITIAL_DELAY_MS;
+        for attempt in 1..=RETRY_MAX_ATTEMPTS {
+            let resp = build_request()
+                .send()
+                .await
+                .map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("HTTP request failed: {}", e),
+                    status: None,
+                    body: None,
+                })?;
+
+            let status = resp.status().as_u16();
+
+            if (200..300).contains(&(status as usize)) {
+                return Ok(resp);
+            }
+
+            if (status == 429 || status == 503) && attempt < RETRY_MAX_ATTEMPTS {
+                let retry_after_ms = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|secs| secs * 1_000);
+                let wait_ms = retry_after_ms.unwrap_or(delay_ms);
+                warn!(
+                    status = status,
+                    attempt = attempt,
+                    wait_ms = wait_ms,
+                    "Provider throttled, retrying with geometric backoff"
+                );
+                drop(resp);
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                delay_ms =
+                    ((delay_ms as f64 * RETRY_GEOMETRIC_RATIO) as u64).min(RETRY_MAX_DELAY_MS);
+                continue;
+            }
+
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.map_http_error(status, &text));
+        }
+
+        Err(ProviderError::ServerError {
+            provider: self.id.clone(),
+            status: Some(503),
+            message: format!("Server busy after {} attempts", RETRY_MAX_ATTEMPTS),
+            is_retryable: false,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Non-streaming
     // -----------------------------------------------------------------------
@@ -431,41 +505,30 @@ impl OpenAiCompatProvider {
         merge_openai_compatible_options(&mut body, &request.provider_options);
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let builder = self
-            .http_client
-            .post(&url)
-            .header("Content-Type", "application/json");
-        let builder = self.apply_auth(builder);
-        let builder = self.apply_extra_headers(builder);
+        let resp = self
+            .send_with_retry(|| {
+                let b = self
+                    .http_client
+                    .post(&url)
+                    .header("Content-Type", "application/json");
+                let b = self.apply_auth(b);
+                let b = self.apply_extra_headers(b);
+                b.json(&body)
+            })
+            .await?;
 
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
-
-        let status = resp.status().as_u16();
         let text = resp.text().await.map_err(|e| ProviderError::Other {
             provider: self.id.clone(),
             message: format!("Failed to read response body: {}", e),
-            status: Some(status),
+            status: None,
             body: None,
         })?;
-
-        if !(200..300).contains(&(status as usize)) {
-            return Err(self.map_http_error(status, &text));
-        }
 
         let json: Value =
             serde_json::from_str(&text).map_err(|e| ProviderError::Other {
                 provider: self.id.clone(),
                 message: format!("Failed to parse response JSON: {}", e),
-                status: Some(status),
+                status: None,
                 body: Some(text.clone()),
             })?;
 
@@ -513,32 +576,17 @@ impl OpenAiCompatProvider {
         merge_openai_compatible_options(&mut body, &request.provider_options);
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let builder = self
-            .http_client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
-        let builder = self.apply_auth(builder);
-        let builder = self.apply_extra_headers(builder);
-
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
-
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&(status as usize)) {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(self.map_http_error(status, &text));
-        }
-
-        Ok(resp)
+        self.send_with_retry(|| {
+            let b = self
+                .http_client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream");
+            let b = self.apply_auth(b);
+            let b = self.apply_extra_headers(b);
+            b.json(&body)
+        })
+        .await
     }
 
     // -----------------------------------------------------------------------

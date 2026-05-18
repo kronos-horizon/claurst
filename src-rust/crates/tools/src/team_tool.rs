@@ -29,6 +29,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Maximum number of nested `TeamCreate` invocations allowed before refusing.
+pub const MAX_TEAM_DEPTH: u32 = 3;
+
+/// Per-agent wall-clock deadline.  Production: 2 minutes.  Tests: 2 seconds.
+#[cfg(not(test))]
+const AGENT_TIMEOUT_SECS: u64 = 120;
+#[cfg(test)]
+const AGENT_TIMEOUT_SECS: u64 = 2;
+
 // ---------------------------------------------------------------------------
 // Global agent-runner injection
 // ---------------------------------------------------------------------------
@@ -59,6 +68,19 @@ pub type AgentRunFn = Arc<
 
 static AGENT_RUNNER: OnceCell<AgentRunFn> = OnceCell::new();
 
+/// Test-only override: when set, `run_agent` bypasses the global AGENT_RUNNER.
+/// Protected by TEST_LOCK (tokio::sync::Mutex) so tests that set it don't
+/// race with each other across async await points.
+#[cfg(test)]
+static TEST_AGENT_RUNNER: once_cell::sync::Lazy<parking_lot::Mutex<Option<AgentRunFn>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
+
+/// Tokio mutex used by tests to serialise access to TEST_AGENT_RUNNER.
+/// Held across `.await` points (tokio::sync::MutexGuard is Send).
+#[cfg(test)]
+static TEST_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
 /// Register the global agent runner.  Called once at process startup by cc-query.
 ///
 /// # Panics
@@ -81,6 +103,14 @@ async fn run_agent(
     max_turns: Option<u32>,
     ctx: Arc<ToolContext>,
 ) -> String {
+    #[cfg(test)]
+    {
+        // Clone the Arc out of the lock so we don't hold it across the await.
+        let runner_opt: Option<AgentRunFn> = TEST_AGENT_RUNNER.lock().clone();
+        if let Some(runner) = runner_opt {
+            return runner(description, prompt, tools, system, max_turns, ctx).await;
+        }
+    }
     if let Some(runner) = AGENT_RUNNER.get() {
         runner(description, prompt, tools, system, max_turns, ctx).await
     } else {
@@ -279,6 +309,15 @@ impl Tool for TeamCreateTool {
             return ToolResult::error("task is required for TeamCreate".to_string());
         }
 
+        // Enforce recursion depth limit so nested TeamCreate calls cannot cascade.
+        if ctx.team_depth >= MAX_TEAM_DEPTH {
+            return ToolResult::error(format!(
+                "TeamCreate recursion depth limit ({}) exceeded. \
+                 Nested team creation beyond depth {} is not permitted.",
+                MAX_TEAM_DEPTH, MAX_TEAM_DEPTH
+            ));
+        }
+
         let safe_name = sanitize_name(&params.team_name);
         let lead_agent_id = format!("team-lead@{}", safe_name);
 
@@ -375,8 +414,10 @@ impl Tool for TeamCreateTool {
 
         ACTIVE_TEAMS.insert(final_name.clone(), cancel_tokens.clone());
 
-        // Wrap the ToolContext in an Arc so it can be shared across agent futures.
-        let ctx_arc = Arc::new(ctx.clone());
+        // Increment depth so sub-agents can enforce the recursion limit.
+        let mut sub_ctx = ctx.clone();
+        sub_ctx.team_depth = ctx.team_depth + 1;
+        let ctx_arc = Arc::new(sub_ctx);
 
         // Build per-agent futures.
         let agent_futures: Vec<_> = params
@@ -412,6 +453,7 @@ impl Tool for TeamCreateTool {
                         return (agent_name, "[Cancelled before start]".to_string());
                     }
 
+                    let timeout_name = agent_name.clone();
                     let result = tokio::select! {
                         out = run_agent(
                             description,
@@ -422,6 +464,9 @@ impl Tool for TeamCreateTool {
                             ctx_inner,
                         ) => out,
                         _ = cancel.cancelled() => "[Agent cancelled by TeamDelete]".to_string(),
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(AGENT_TIMEOUT_SECS)) => {
+                            format!("[Agent '{}' timed out after {}s]", timeout_name, AGENT_TIMEOUT_SECS)
+                        }
                     };
 
                     (agent_name, result)
@@ -584,5 +629,263 @@ impl Tool for TeamDeleteTool {
             })
             .to_string(),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn make_ctx(depth: u32) -> ToolContext {
+        use claurst_core::config::{Config, PermissionMode};
+        use claurst_core::permissions::AutoPermissionHandler;
+        ToolContext {
+            working_dir: std::path::PathBuf::from("/tmp"),
+            permission_mode: PermissionMode::Default,
+            permission_handler: Arc::new(AutoPermissionHandler {
+                mode: PermissionMode::Default,
+            }),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "team-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            team_depth: depth,
+        }
+    }
+
+    /// Instant stub runner: returns "result:<task>" immediately.
+    /// Keyed on task only (not description) so parallel and serial runs over
+    /// the same agents produce identical per-agent outputs.
+    fn instant_runner() -> AgentRunFn {
+        Arc::new(
+            |_desc: String,
+             task: String,
+             _tools: Option<Vec<String>>,
+             _sys: Option<String>,
+             _max: Option<u32>,
+             _ctx: Arc<ToolContext>| {
+                Box::pin(async move { format!("result:{}", task) })
+                    as Pin<Box<dyn std::future::Future<Output = String> + Send>>
+            },
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 0: Serializability — parallel and serial produce identical per-agent
+    // outputs (just potentially in different order).
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_serial_parallel_serializable() {
+        let _guard = TEST_LOCK.lock().await;
+        *TEST_AGENT_RUNNER.lock() = Some(instant_runner());
+
+        let ctx = make_ctx(0);
+        let agents = serde_json::json!([
+            {"name": "alpha", "task": "task-A"},
+            {"name": "beta",  "task": "task-B"},
+            {"name": "gamma", "task": "task-C"},
+        ]);
+
+        // Parallel run.
+        let r_par = TeamCreateTool
+            .execute(
+                serde_json::json!({
+                    "team_name": "test-ser-par",
+                    "task": "shared",
+                    "agents": agents,
+                    "parallel": true,
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!r_par.is_error, "parallel run failed: {}", r_par.content);
+
+        // Serial run.
+        let r_ser = TeamCreateTool
+            .execute(
+                serde_json::json!({
+                    "team_name": "test-ser-seq",
+                    "task": "shared",
+                    "agents": agents,
+                    "parallel": false,
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!r_ser.is_error, "serial run failed: {}", r_ser.content);
+
+        // Extract and sort per-agent (name, output) pairs from both runs.
+        let extract = |content: &str| -> Vec<(String, String)> {
+            let v: serde_json::Value = serde_json::from_str(content).unwrap();
+            let mut pairs: Vec<(String, String)> = v["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    (
+                        r["agent"].as_str().unwrap().to_string(),
+                        r["output"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            pairs
+        };
+
+        let par_results = extract(&r_par.content);
+        let ser_results = extract(&r_ser.content);
+
+        assert_eq!(
+            par_results, ser_results,
+            "parallel and serial results differ — serializability violated"
+        );
+
+        *TEST_AGENT_RUNNER.lock() = None;
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 1: Recursion depth — TeamCreate refuses at depth >= MAX_TEAM_DEPTH.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_recursion_depth_limit() {
+        let ctx = make_ctx(MAX_TEAM_DEPTH);
+        let result = TeamCreateTool
+            .execute(
+                serde_json::json!({
+                    "team_name": "nested-team",
+                    "task": "some task",
+                    "agents": [{"name": "bot"}],
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(
+            result.is_error,
+            "expected an error when team_depth >= MAX_TEAM_DEPTH"
+        );
+        assert!(
+            result.content.contains("recursion depth limit"),
+            "error should mention recursion depth, got: {}",
+            result.content
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 2: Depth is incremented for sub-agents — a depth-2 ctx only has
+    // one level of slack left, so a nested call at depth-2 proceeds but the
+    // sub-agent's ctx would be depth-3 (blocked on next attempt).
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_depth_incremented_for_sub_agents() {
+        let _guard = TEST_LOCK.lock().await;
+
+        // Runner that captures the depth of the ctx it receives.
+        let captured_depth = Arc::new(std::sync::Mutex::new(None::<u32>));
+        let captured_depth_clone = captured_depth.clone();
+        *TEST_AGENT_RUNNER.lock() = Some(Arc::new(
+            move |_desc: String,
+                  _task: String,
+                  _tools: Option<Vec<String>>,
+                  _sys: Option<String>,
+                  _max: Option<u32>,
+                  ctx: Arc<ToolContext>| {
+                let captured = captured_depth_clone.clone();
+                Box::pin(async move {
+                    *captured.lock().unwrap() = Some(ctx.team_depth);
+                    "done".to_string()
+                }) as Pin<Box<dyn std::future::Future<Output = String> + Send>>
+            },
+        ));
+
+        let ctx = make_ctx(0);
+        let result = TeamCreateTool
+            .execute(
+                serde_json::json!({
+                    "team_name": "test-depth-inc",
+                    "task": "t",
+                    "agents": [{"name": "a"}],
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+
+        let depth = captured_depth.lock().unwrap().unwrap();
+        assert_eq!(
+            depth, 1,
+            "sub-agent context should have team_depth = parent + 1"
+        );
+
+        *TEST_AGENT_RUNNER.lock() = None;
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 3: Per-agent timeout — agents that exceed AGENT_TIMEOUT_SECS are
+    // replaced with a timeout message, not an error return from execute.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_agent_timeout() {
+        let _guard = TEST_LOCK.lock().await;
+
+        *TEST_AGENT_RUNNER.lock() = Some(Arc::new(
+            |_desc: String,
+             _task: String,
+             _tools: Option<Vec<String>>,
+             _sys: Option<String>,
+             _max: Option<u32>,
+             _ctx: Arc<ToolContext>| {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        AGENT_TIMEOUT_SECS + 5,
+                    ))
+                    .await;
+                    "should not reach here".to_string()
+                }) as Pin<Box<dyn std::future::Future<Output = String> + Send>>
+            },
+        ));
+
+        let ctx = make_ctx(0);
+        let result = TeamCreateTool
+            .execute(
+                serde_json::json!({
+                    "team_name": "test-timeout",
+                    "task": "slow task",
+                    "agents": [{"name": "slow-bot"}],
+                    "parallel": false,
+                }),
+                &ctx,
+            )
+            .await;
+
+        // execute itself must succeed (timeout is per-agent, not a hard error).
+        assert!(
+            !result.is_error,
+            "execute should succeed even when an agent times out: {}",
+            result.content
+        );
+        let val: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        let output = val["results"][0]["output"].as_str().unwrap_or("");
+        assert!(
+            output.contains("timed out"),
+            "expected timeout message in agent output, got: {}",
+            output
+        );
+
+        *TEST_AGENT_RUNNER.lock() = None;
     }
 }
