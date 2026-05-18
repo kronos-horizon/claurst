@@ -591,6 +591,13 @@ impl ModelPickerState {
     pub fn set_models(&mut self, entries: Vec<ModelEntry>) {
         // Apply is_current flag from the remembered model before replacing.
         let current_id = self.current_model_id.clone();
+        // Snapshot the model the cursor is pointing at *before* replacing the list.
+        // If the user moved the cursor while the fetch was in-flight we want to
+        // stay there, not snap back to the originally-active model.
+        let pointed_at_id = self
+            .filtered_models()
+            .get(self.selected_idx)
+            .map(|m| m.id.clone());
         self.models = entries;
         if let Some(ref id) = current_id {
             for m in &mut self.models {
@@ -599,12 +606,17 @@ impl ModelPickerState {
         }
         self.loading_models = false;
         self.models_loaded = true;
-        // Restore cursor to the previously-selected model; fall back to 0
-        // if the model no longer exists on the endpoint.
+        // Prefer restoring to where the cursor was; fall back to current_model_id;
+        // fall back to 0 if neither exists in the new list.
         let filtered = self.filtered_models();
-        self.selected_idx = current_id
+        self.selected_idx = pointed_at_id
             .as_deref()
             .and_then(|id| filtered.iter().position(|m| m.id == id))
+            .or_else(|| {
+                current_id
+                    .as_deref()
+                    .and_then(|id| filtered.iter().position(|m| m.id == id))
+            })
             .unwrap_or(0);
     }
 
