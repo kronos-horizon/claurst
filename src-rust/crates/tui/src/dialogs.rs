@@ -1040,7 +1040,6 @@ pub fn render_mcp_approval_dialog(
     lines.push(Line::from(""));
 
     // Server name.
-    let server_label = format!("  Server:  {}", truncate_str(&state.server_name, text_width.saturating_sub(10)));
     lines.push(Line::from(vec![
         Span::styled("  Server:  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -1048,7 +1047,6 @@ pub fn render_mcp_approval_dialog(
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
     ]));
-    let _ = server_label; // suppress unused warning
 
     // URL or command.
     if let Some(ref url) = state.server_url {

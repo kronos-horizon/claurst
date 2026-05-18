@@ -505,7 +505,7 @@ fn render_field_value_line<'a>(field: &'a ElicitationField, focused: bool, width
         ElicitationFieldKind::MultiEnum { options, checked } => {
             let sub_cursor: usize = field.value.parse().unwrap_or(0);
             let mut spans: Vec<Span> = vec![Span::raw("   ")];
-            for (i, ((v, lbl), &is_checked)) in options.iter().zip(checked.iter()).enumerate() {
+            for (i, ((_, lbl), &is_checked)) in options.iter().zip(checked.iter()).enumerate() {
                 let on_cursor = focused && i == sub_cursor;
                 let check = if is_checked { "[x] " } else { "[ ] " };
                 let style = if on_cursor {
@@ -515,7 +515,6 @@ fn render_field_value_line<'a>(field: &'a ElicitationField, focused: bool, width
                 } else {
                     Style::default().fg(Color::Gray)
                 };
-                let _ = v; // suppress unused warning
                 spans.push(Span::styled(format!("{check}{lbl}  "), style));
             }
             Line::from(spans)

@@ -668,7 +668,6 @@ fn build_display_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(""));
 
-    let _ = cfg; // suppress unused warning
     lines
 }
 

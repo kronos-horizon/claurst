@@ -755,7 +755,6 @@ pub fn render_qr(url: &str) -> Vec<String> {
 
     // Add a 2-module quiet zone on each side (QR spec requires ≥4, but 2 renders fine).
     let qz = 2usize;
-    let padded_width = width + qz * 2;
 
     // Helper: return true if module at (row, col) is dark, treating the quiet zone as light.
     let dark = |row: isize, col: isize| -> bool {
@@ -767,7 +766,6 @@ pub fn render_qr(url: &str) -> Vec<String> {
 
     let mut lines = Vec::new();
     // Iterate two matrix rows per terminal line.
-    let total_rows = (width + qz * 2) as isize;
     let mut r: isize = -(qz as isize);
     while r < (width + qz) as isize {
         let mut line = String::new();
@@ -784,8 +782,6 @@ pub fn render_qr(url: &str) -> Vec<String> {
         lines.push(line);
         r += 2;
     }
-    let _ = padded_width; // suppress unused warning
-    let _ = total_rows;
     lines
 }
 
